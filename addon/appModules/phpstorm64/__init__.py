@@ -1,6 +1,17 @@
-# PHPStorm add-on for NVDA
-# PHPStorm enhancements. Provides support for DOCBlock annotations indents, better controls readability (proper labeling), code readability when navigating through code with keyboard shortcuts, code reading when jumping through debug breakpoints, last log message reading capability, better word-by-word navigation.
-# Copyright 2021 Paulius Leveris
+# phpstorm64/__init__.py
+# A part of PHPStorm add-on for NVDA
+# PHPStorm enhancements. Provides support for DOCBlock annotations indents, better controls readability (proper labeling), code readability when navigating through code with keyboard shortcuts, code reading when jumping through debug breakpoints, last log message reading capability, better word-by-word navigation and reporting of line overflows.
+# Copyright 2021 Paulius Leveris, Justinas Kilciauskas
+#This file is covered by the GNU General Public License.
+#See the file COPYING for more details.
+
+#####
+# Note
+# Some parts of this add-on were taken from other NVDA scripts or add-ons. Specifically, thanks to:
+# NVDA script for IntelliJ (by Samuel Kacer): status bar script, some other navigation scripts;
+# Add-on for Notepad++ (by Derek Riemer): scripts for line overflows.
+
+#####
 
 import appModuleHandler, controlTypes, buildVersion, tones, ui, api
 from NVDAObjects import NVDAObject
@@ -9,6 +20,10 @@ from scriptHandler import script
 from winsound import PlaySound, SND_ASYNC, SND_ALIAS
 import speech, textInfos, treeInterceptorHandler
 from speech.types import SpeechSequence
+import config, gui, addonHandler
+from . import addonSettingsPanel
+
+addonHandler.initTranslation()
 
 old = False
 if buildVersion.version_year <= 2020: old = True # NVDA 2021.1 has updated speech function calls, so in order to provide support for previous releases, need to ensure the version of NVDA user is running.
@@ -18,16 +33,33 @@ class AppModule(appModuleHandler.AppModule):
 
 	def __init__(self, *args, **kwargs):
 		super(AppModule, self).__init__(*args, **kwargs)
+		# config and GUI preparations
+		confspec = {
+			"maxLineLength" : "integer(min=0, default=80)",
+			"lineLengthIndicator" : "boolean(default=False)",
+			"docblockAnnotationIndents" : "boolean(default=True)",
+		}
+		config.conf.spec["PHPStorm"] = confspec
+
+		gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(
+			addonSettingsPanel.SettingsPanel)
+
 		global original, old
 		original = speech.speech.speak if not old else speech.speak
-		ui.message("PHPStorm enhancement loaded")
+#		ui.message("PHPStorm enhancement loaded")
 
 	def terminate(self):
+		try:
+			gui.settingsDialogs.NVDASettingsDialog.categoryClasses.remove(
+				addonSettingsPanel.SettingsPanel)
+		except IndexError: pass
+
 		super().terminate()
-		if not old:
-			speech.speech.speak = original
-		else:
-			speech.speak = original
+		if config.conf["PHPStorm"]["docblockAnnotationIndents"]:
+			if not old:
+				speech.speech.speak = original
+			else:
+				speech.speak = original
 
 	# Different classes according to things that needed to be handled.
 	def chooseNVDAObjectOverlayClasses (self, obj, clsList):
@@ -38,7 +70,7 @@ class AppModule(appModuleHandler.AppModule):
 	@script(gesture = 'kb:NVDA+i')
 	def script_readStatusBar(self, gesture):
 		obj = api.getForegroundObject().simpleFirstChild
-		tones.beep(500,50)
+#		tones.beep(500,50)
 
 		while obj is not None:
 			if obj.role is controlTypes.ROLE_STATUSBAR and obj.simpleFirstChild is not None:
@@ -46,13 +78,15 @@ class AppModule(appModuleHandler.AppModule):
 				ui.browseableMessage(msg, isHtml=False)
 				return
 			obj = obj.simpleNext
-		ui.message('No info in logs')
+		# Translators: a message saying there are no info in PHPStorm logs
+		ui.message(_('No info in logs'))
 
 	# Read elements that otherwise are skipped and needed to be checked with Review cursor instead.
 	def event_gainFocus(self, obj, nextHandler):
 		# Read editable element names
 		if obj.role is controlTypes.ROLE_EDITABLETEXT and obj.name:
-			ui.message(obj.name + ' editable')
+			# Translators: object is an editable element (e.g., Search box)
+			ui.message(_('{} editable').format(obj.name))
 		# Read radio button labels altogether with corresponding their values which happened to be names here
 		elif obj.role is controlTypes.ROLE_RADIOBUTTON and obj.name and obj.previous:
 			# Find that label
@@ -73,7 +107,7 @@ class AppModule(appModuleHandler.AppModule):
 			obj.name = obj.previous.name
 		nextHandler()
 
-# Rewrite default source code navigation behaviour, indentation included.
+# Rewrite default source code navigation behaviour, with support for DOCBlock annotation indents.
 class EnhancedCodeNavigation(EditableTextWithoutAutoSelectDetection):
 	# Remember if last keyboard shortcut was related to debugging to know how to react when caret changes
 	lastDebuggingGesture = False
@@ -129,7 +163,11 @@ class EnhancedCodeNavigation(EditableTextWithoutAutoSelectDetection):
 		"kb:control+leftArrow": "moveByWord",
 		# Previous word
 		"kb:control+rightArrow": "moveByWord",
-		
+		 # These gestures trigger reporting of line overflow
+		"kb:upArrow": "reportLineOverflow",
+		"kb:downArrow": "reportLineOverflow",
+		# "kb:NVDA+g": "goToFirstOverflowingCharacter",  currently excluding; This doesn't work as we expect
+
 		# these gestures trigger selection change
 		# Select Successively Incresing Code blocks
 		"kb:control+w": "caret_changeSelection",
@@ -178,23 +216,37 @@ class EnhancedCodeNavigation(EditableTextWithoutAutoSelectDetection):
 			caretInfo.expand(textInfos.UNIT_WORD)
 		speech.speakTextInfo(caretInfo, reason = controlTypes.OutputReason.CARET, unit = textInfos.UNIT_WORD)
 
+	# Script to report line overflow
+	def script_reportLineOverflow(self, gesture):
+		self.script_caret_moveByLine(gesture)
+		if not config.conf["PHPStorm"]["lineLengthIndicator"]:
+			return
+		info = self.makeTextInfo(textInfos.POSITION_CARET)
+		info.expand(textInfos.UNIT_LINE)
+		if len(info.text.strip('\r\n\t ')) > config.conf["PHPStorm"]["maxLineLength"]:
+			tones.beep(500, 50)
+
 # Trigger when editor gains focus.
 	def event_gainFocus(self):
-		# Read indentation
+		# Read indentation (only if this setting is toggled)
 		global original, old
-		if not old: speech.speech.speak = self.speakIndentation
-		else: speech.speak = self.speakIndentation
-		self.countAnnounced = 0
+		if config.conf["PHPStorm"]["docblockAnnotationIndents"]:
+			if not old: speech.speech.speak = self.speakIndentation
+			else: speech.speak = self.speakIndentation
 
 	def event_loseFocus(self):
-		if not old: speech.speech.speak = original
-		else: speech.speak = original
+		if config.conf["PHPStorm"]["docblockAnnotationIndents"]:
+			if not old: speech.speech.speak = original
+			else: speech.speak = original
 
 	# Speaks indentation in a special way - not only the beginning of a line, but after * character in docblocks as well.
 	def speakIndentation(self, sequence, *args, **kwargs):
 	# Retrieve last message to be spoken
 		lastSequenceIndex = len(sequence) -1
-		item = sequence[lastSequenceIndex]
+		# Probably fixes some annoying error which sometimes appears while navigating through the code (e.g. making selections)
+		try: item = sequence[lastSequenceIndex]
+		except IndexError: item = ''
+
 		# Check if this part of a source code has nested indentation
 		if isinstance(item, str) and (item.startswith('* ') or item.startswith('*	')):
 			indentationSymbol = item[1]
@@ -213,17 +265,52 @@ class EnhancedCodeNavigation(EditableTextWithoutAutoSelectDetection):
 		# Announce non-indents
 		elif isinstance(item, str) and item.startswith('*'):
 			if self.lastIndentationLevelAnnounced != 0:
-				sequence[lastSequenceIndex] = 'No inner indent ' + sequence[lastSequenceIndex]
+				# Translators: a message saying there is no special indentation in this piece of code
+				sequence[lastSequenceIndex] = _('No inner indent {}').format(sequence[lastSequenceIndex])
 			self.lastIndentationLevelAnnounced = 0
 		else:
 			self.lastIndentationLevelAnnounced = 0
 		original(sequence, *args, **kwargs)
 
-	# Override to catch caret movements when debugging and report the current line.
+	# Override to catch caret movements when debugging and report the current line,
+	# also, announce line overflows when moving the caret (e.g. when typing over the specified line length).
 	def event_caret(self):
+		super(EnhancedCodeNavigation, self).event_caret()
+		# debugging
 		if self.lastDebuggingGesture:
 			self.lastDebuggingGesture = False
 			self.reportCurrentLine()
+		# line overflows
+		if not config.conf["PHPStorm"]["lineLengthIndicator"]:
+			return
+		caretInfo = self.makeTextInfo(textInfos.POSITION_CARET)
+		lineStartInfo = self.makeTextInfo(textInfos.POSITION_CARET).copy()
+		caretInfo.expand(textInfos.UNIT_CHARACTER)
+		lineStartInfo.expand(textInfos.UNIT_LINE)
+		caretPosition = caretInfo.bookmark.startOffset -lineStartInfo.bookmark.startOffset
+		#Is it not a blank line, and are we further in the line than the marker position?
+		if caretPosition > config.conf["PHPStorm"]["maxLineLength"] -1 and caretInfo.text not in ['\r', '\n']:
+			tones.beep(500, 50)
+
+	# Script to go to the 1st character after specified line length
+	# For some reason it fails to move the caret to the actual symbol,
+	# so for now this sscript is not used.
+	# The other approach we have found how to achieve this as we are currently unable to do it by a script, is as follows:
+	# in PHPStorm Window, pressing ctrl+G, and after the line number type :, and then actual symbol you want to move to.
+	# For example, typing 20:81, should move you to 81st symbol in 20th line.
+
+	def script_goToFirstOverflowingCharacter(self, gesture):
+		info = self.makeTextInfo(textInfos.POSITION_CARET)
+		info.expand(textInfos.UNIT_LINE)
+		if len(info.text) > config.conf["PHPStorm"]["maxLineLength"]:
+			info.move(textInfos.UNIT_CHARACTER, config.conf["PHPStorm"]["maxLineLength"], "start") # For some reason it's not working, I have no idea why... Even it outputs the correct position it should move caret to...
+			info.updateCaret() # Maybe the problem is here?
+			info.collapse()
+			info.expand(textInfos.UNIT_CHARACTER)
+			speech.speakMessage(info.text) # this works just fine...
+
+	#Translators: Script to move the cursor to the first character on the current line that exceeds the users maximum allowed line length.
+	script_goToFirstOverflowingCharacter.__doc__ = _("Moves to the first character that is after the maximum line length")
 
 	def reportCurrentLine(self):
 		obj=api.getFocusObject()
